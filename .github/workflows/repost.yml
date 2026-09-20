@@ -1,0 +1,48 @@
+name: repost
+
+on:
+  schedule:
+    - cron: "13 */4 * * *"   # every 4 hours at :13 past (UTC). The off-zero
+                             # minute avoids GitHub's top-of-hour congestion.
+  workflow_dispatch:          # allows manual runs from the Actions tab
+
+permissions:
+  contents: write             # needed to commit state.json back
+
+concurrency:
+  group: repost               # never let two runs overlap
+  cancel-in-progress: false
+
+jobs:
+  repost:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Post the next item on each platform
+        env:
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
+          IG_TOKEN: ${{ secrets.IG_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+        run: python repost.py
+
+      - name: Commit progress
+        if: always()
+        run: |
+          git config user.name "repost-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state.json 2>/dev/null || true
+          git add ig_queue.json 2>/dev/null || true
+          git commit -m "progress" || echo "nothing to commit"
+          git push || echo "WARNING: push failed - state not saved this run"
