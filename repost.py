@@ -71,7 +71,7 @@ def save_json(path, obj):
 def ig_queue():
     """All IG feed posts older than CUTOFF, newest first."""
     out, url = [], f"{GRAPH}/{IG_USER_ID}/media"
-    params = {"fields": "id,timestamp", "limit": 25, "access_token": IG_TOKEN}
+    params = {"fields": "id,timestamp", "limit": 10, "access_token": IG_TOKEN}
     while url:
         r = requests.get(url, params=params, timeout=30).json()
         if "error" in r:
