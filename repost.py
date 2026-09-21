@@ -134,4 +134,252 @@ def fetch_post(item_id):
         "fields": "caption,media_type,media_url,children{media_type,media_url}",
         "access_token": IG_TOKEN}, timeout=30).json()
     if "error" in r:
-        raise RuntimeError("IG fetch error: " + r["error
+        raise RuntimeError("IG fetch error: " + r["error"].get("message", ""))
+    return r
+
+
+# ---------------------------------------------------- repost to Instagram
+
+def ig_publish(post):
+    """Re-publish one IG post as a new post. True on success."""
+    caption = post.get("caption") or ""
+
+    def container(payload):
+        c = S.post(f"{GRAPH}/{IG_USER_ID}/media", data=payload,
+                   timeout=120).json()
+        if "error" in c:
+            raise RuntimeError("IG container error: " + c["error"].get("message", ""))
+        return c["id"]
+
+    def child(c):
+        d = {"is_carousel_item": "true", "access_token": IG_TOKEN}
+        if c["media_type"] == "VIDEO":
+            d |= {"media_type": "VIDEO", "video_url": c["media_url"]}
+        else:
+            d["image_url"] = c["media_url"]
+        return container(d)
+
+    if post["media_type"] == "CAROUSEL":
+        kids = [child(c) for c in post.get("children", {}).get("data", [])]
+        cid = container({"media_type": "CAROUSEL", "children": ",".join(kids),
+                         "caption": caption, "access_token": IG_TOKEN})
+    elif post["media_type"] == "VIDEO":
+        try:    # try as a Reel first, plain video post as fallback
+            cid = container({"media_type": "REELS", "video_url": post["media_url"],
+                             "caption": caption, "access_token": IG_TOKEN})
+        except RuntimeError as e:
+            print(e)
+            cid = container({"media_type": "VIDEO", "video_url": post["media_url"],
+                             "caption": caption, "access_token": IG_TOKEN})
+    else:
+        cid = container({"image_url": post["media_url"], "caption": caption,
+                         "access_token": IG_TOKEN})
+
+    for _ in range(60):                     # wait for processing (videos)
+        s = S.get(f"{GRAPH}/{cid}", params={"fields": "status_code",
+                 "access_token": IG_TOKEN}, timeout=30).json()
+        if s.get("status_code") == "FINISHED":
+            break
+        if s.get("status_code") == "ERROR":
+            print("IG processing error")
+            return False
+        time.sleep(5)
+
+    p = S.post(f"{GRAPH}/{IG_USER_ID}/media_publish",
+               data={"creation_id": cid, "access_token": IG_TOKEN},
+               timeout=30).json()
+    if "error" in p:
+        print("IG publish error:", p["error"].get("message"))
+        return False
+    print("IG posted:", p["id"])
+    return True
+
+
+# ---------------------------------------------------- cross-post to X
+
+def download_media(url, dest_dir):
+    """Download an IG CDN file. Returns local path or None."""
+    base = url.split("?")[0].split("/")[-1] or "media"
+    path = Path(dest_dir) / base
+    with S.get(url, stream=True, timeout=180) as r:
+        if not r.ok:
+            print(f"download failed {r.status_code}: {url[:100]}")
+            return None
+        ctype = r.headers.get("Content-Type", "")
+        if "video" in ctype and path.suffix.lower() not in (".mp4", ".mov"):
+            path = path.with_suffix(".mp4")
+        elif "image" in ctype and path.suffix.lower() not in (".jpg", ".jpeg",
+                                                              ".png", ".webp"):
+            path = path.with_suffix(".jpg")
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                f.write(chunk)
+    return str(path)
+
+
+def media_id(response):
+    if not response.ok:
+        print(f"X upload error {response.status_code}: {response.text[:200]}")
+        return None
+    body = response.json() if response.text.strip() else {}
+    return (body.get("data") or {}).get("id") or body.get("media_id_string")
+
+
+def upload_simple(path):
+    with open(path, "rb") as f:
+        r = X.post(UPLOAD_URL, data={"media_category": "tweet_image"},
+                   files={"media": f}, timeout=300)
+    return media_id(r)
+
+
+def upload_chunked(path, media_type, category):
+    init = {"command": "INIT", "media_type": media_type,
+            "media_category": category, "total_bytes": os.path.getsize(path)}
+    r = X.post(UPLOAD_URL, json=init, timeout=300)
+    if not r.ok:
+        r = X.post(UPLOAD_URL, data=init, timeout=300)
+    mid = media_id(r)
+    if not mid:
+        return None
+    with open(path, "rb") as f:
+        for seg, chunk in enumerate(iter(lambda: f.read(4 * 1024 * 1024), b"")):
+            r = X.post(UPLOAD_URL,
+                       data={"command": "APPEND", "media_id": mid,
+                             "segment_index": seg},
+                       files={"media": ("chunk", chunk)}, timeout=300)
+            if not r.ok:
+                print(f"X append error {r.status_code}: {r.text[:200]}")
+                return None
+    fin = {"command": "FINALIZE", "media_id": mid}
+    r = X.post(UPLOAD_URL, json=fin, timeout=300)
+    if not r.ok:
+        r = X.post(UPLOAD_URL, data=fin, timeout=300)
+    if not r.ok:
+        print(f"X finalize error {r.status_code}: {r.text[:200]}")
+        return None
+    body = r.json() if r.text.strip() else {}
+    info = (body.get("data") or {}).get("processing_info") or body.get("processing_info")
+    while info and info.get("state") not in ("succeeded", "FINISHED"):
+        if info.get("state") in ("failed", "ERROR"):
+            print("X media processing failed")
+            return None
+        time.sleep(min(info.get("check_after_secs", 5), 30))
+        r = X.get(UPLOAD_URL, params={"command": "STATUS", "media_id": mid},
+                  timeout=30)
+        body = r.json() if r.text.strip() else {}
+        info = ((body.get("data") or {}).get("processing_info")
+                or body.get("processing_info"))
+    return mid
+
+
+def upload(path):
+    ext = Path(path).suffix.lower()
+    if ext in (".mp4", ".mov"):
+        return upload_chunked(path, "video/mp4" if ext == ".mp4" else "video/quicktime",
+                              "tweet_video")
+    if os.path.getsize(path) > 5 * 1024 * 1024:     # big image: chunked upload
+        return upload_chunked(path, "image/jpeg", "tweet_image")
+    return upload_simple(path)
+
+
+def x_post(post):
+    """Cross-post one IG item to X as a new tweet. True on success."""
+    tmp = tempfile.mkdtemp()
+    try:
+        # X allows one video OR up to four photos per tweet
+        if post["media_type"] == "CAROUSEL":
+            kids = post.get("children", {}).get("data", [])
+            vids = [c for c in kids if c["media_type"] == "VIDEO"]
+            picks = vids[:1] if vids else [c for c in kids
+                                            if c["media_type"] != "VIDEO"][:4]
+        elif post["media_type"] == "VIDEO":
+            picks = [post]
+        else:
+            picks = [post]
+
+        ids = []
+        for m in picks:
+            f = download_media(m["media_url"], tmp)
+            if f:
+                mid = upload(f)
+                if mid:
+                    ids.append(mid)
+
+        text = post.get("caption") or ""
+        if X_STRIP_HASHTAGS:
+            text = " ".join(w for w in text.split() if not w.startswith("#"))
+        payload = {}
+        if text:
+            payload["text"] = text[:TWEET_MAX]
+        if ids:
+            payload["media"] = {"media_ids": ids}
+        if not payload:
+            print("X item has no caption and no usable media - skipping")
+            return False
+        r = X.post(TWEET_URL, json=payload, timeout=60)
+        if r.ok:
+            print("X posted:", r.json()["data"]["id"])
+            return True
+        print(f"X post error {r.status_code}: {r.text[:300]}")
+        return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# -------------------------------------------------------------------- main
+
+def run_platform(name, state, idx_key, fail_key, queue, post_fn):
+    """Post the next queue item; remember progress; skip after MAX_TRIES fails."""
+    idx, fails = state.get(idx_key, 0), state.get(fail_key, 0)
+    print(f"{name} backlog: {len(queue)} items, next: #{idx + 1}")
+    if idx >= len(queue):
+        print(f"{name}: backlog exhausted")
+        return
+    try:
+        ok = post_fn(queue[idx])
+    except Exception as e:                  # never let one platform kill the run
+        print(f"{name} error: {e}")
+        ok = False
+    if ok:
+        state[idx_key] = idx + 1
+        state[fail_key] = 0
+    else:
+        state[fail_key] = fails + 1
+        if state[fail_key] >= MAX_TRIES:
+            print(f"{name}: giving up on item #{idx + 1}, skipping it")
+            state[idx_key] = idx + 1
+            state[fail_key] = 0
+    save_json(STATE_FILE, state)
+
+
+def main():
+    if not (IG_TOKEN and IG_USER_ID):
+        print("IG credentials missing - cannot build the backlog, nothing to do")
+        return
+
+    state = load_json(STATE_FILE, {"x": 0, "ig": 0, "x_fail": 0, "ig_fail": 0})
+    cache = load_json(IG_QUEUE_FILE, None)
+    if isinstance(cache, list:               # old-format cache
+        igq = cache
+    elif isinstance(cache, dict) and cache.get("done"):
+        igq = cache["items"]
+    else:
+        try:
+            igq = ig_queue()
+            print(f"IG backlog built: {len(igq)} items")
+        except Exception as e:
+            print("IG backlog build interrupted, will resume next run:", e)
+            return
+
+    if X:
+        run_platform("X", state, "x", "x_fail", igq,
+                     lambda item: x_post(fetch_post(item["id"])))
+    else:
+        print("X credentials not set - skipping X")
+
+    run_platform("IG", state, "ig", "ig_fail", igq,
+                 lambda item: ig_publish(fetch_post(item["id"])))
+
+
+if __name__ == "__main__":
+    main()
