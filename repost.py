@@ -359,7 +359,7 @@ def main():
 
     state = load_json(STATE_FILE, {"x": 0, "ig": 0, "x_fail": 0, "ig_fail": 0})
     cache = load_json(IG_QUEUE_FILE, None)
-    if isinstance(cache, list:               # old-format cache
+    if isinstance(cache, list):               # old-format cache
         igq = cache
     elif isinstance(cache, dict) and cache.get("done"):
         igq = cache["items"]
